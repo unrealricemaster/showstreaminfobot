@@ -95,7 +95,7 @@ async def main() -> None:
         )
 
         print("message_id =", message_id)
-        await asyncio.sleep(15)
+        await asyncio.sleep()
         await delete_post(
             bot=bot,
             chat_id=tg_channel_id,
