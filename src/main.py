@@ -1,26 +1,44 @@
-import os
-import json
 import asyncio
+import json
+import logging
+import os
+import signal
+from collections import deque
+from typing import Optional
 
 import httpx
 import websockets
-
 from dotenv import load_dotenv
 from telegram import Bot
 from twitchio import Client
 
 load_dotenv("../.env")
 
-tg_bot_token = os.getenv("TG_BOT_TOKEN")
-tg_channel_id = os.getenv("TG_CHANNEL_ID")
+TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN")
+TG_CHANNEL_ID = os.getenv("TG_CHANNEL_ID")
 
-client_id = os.getenv("TWITCH_CLIENT_ID")
-client_secret = os.getenv("TWITCH_CLIENT_SECRET")
-broadcaster_login = os.getenv("TWITCH_BROADCASTER_LOGIN")
+TWITCH_CLIENT_ID = os.getenv("TWITCH_CLIENT_ID")
+TWITCH_CLIENT_SECRET = os.getenv("TWITCH_CLIENT_SECRET")
+TWITCH_BROADCASTER_LOGIN = os.getenv("TWITCH_BROADCASTER_LOGIN")
 
-twitch_user_access_token = os.getenv("TWITCH_USER_ACCESS_TOKEN")
+TWITCH_USER_ACCESS_TOKEN = os.getenv("TWITCH_USER_ACCESS_TOKEN")
 
 EVENTSUB_WS_URL = "wss://eventsub.wss.twitch.tv/ws"
+RECONNECT_DELAY_SECONDS = 5
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
+
+logger = logging.getLogger("showstreaminfobot")
+
+
+def require_env(name: str) -> str:
+    value = os.getenv(name)
+    if not value:
+        raise RuntimeError(f"Environment variable not found: {name}")
+    return value
 
 
 async def send_post(bot: Bot, chat_id: str, text: str) -> int:
@@ -32,11 +50,12 @@ async def send_post(bot: Bot, chat_id: str, text: str) -> int:
         write_timeout=10,
         pool_timeout=10,
     )
+    logger.info("Message sent | chat_id=%s | message_id=%s", chat_id, message.message_id)
     return message.message_id
 
 
 async def delete_post(bot: Bot, chat_id: str, message_id: int) -> None:
-    await bot.delete_message(
+    result = await bot.delete_message(
         chat_id=chat_id,
         message_id=message_id,
         connect_timeout=10,
@@ -44,18 +63,24 @@ async def delete_post(bot: Bot, chat_id: str, message_id: int) -> None:
         write_timeout=10,
         pool_timeout=10,
     )
+    logger.info(
+        "Message deleted | chat_id=%s | message_id=%s | result=%s",
+        chat_id,
+        message_id,
+        result,
+    )
 
 
 async def fetch_twitch_state() -> dict:
     client = Client(
-        client_id=client_id,
-        client_secret=client_secret,
+        client_id=TWITCH_CLIENT_ID,
+        client_secret=TWITCH_CLIENT_SECRET,
     )
 
     await client.login()
 
     try:
-        users = await client.fetch_users(logins=[broadcaster_login])
+        users = await client.fetch_users(logins=[TWITCH_BROADCASTER_LOGIN])
         if not users:
             raise RuntimeError("Twitch user not found")
 
@@ -66,7 +91,6 @@ async def fetch_twitch_state() -> dict:
             raise RuntimeError("Channel not found")
 
         channel = channels[0]
-
         streams = [stream async for stream in client.fetch_streams(user_ids=[user.id])]
 
         data = {
@@ -93,11 +117,11 @@ async def fetch_twitch_state() -> dict:
 
 def build_post_text(twitch_data: dict) -> str:
     return (
-        f"Стример: {twitch_data['display_name']}\n"
-        f"Логин: {twitch_data['login']}\n"
-        f"Категория: {twitch_data['channel_game']}\n"
-        f"Название стрима: {twitch_data['stream_title'] or twitch_data['channel_title']}\n"
-        f"Ссылка: https://twitch.tv/{twitch_data['login']}"
+        f"Streamer: {twitch_data['display_name']}\n"
+        f"Login: {twitch_data['login']}\n"
+        f"Category: {twitch_data['channel_game']}\n"
+        f"Stream title: {twitch_data['stream_title'] or twitch_data['channel_title']}\n"
+        f"Link: https://twitch.tv/{twitch_data['login']}"
     )
 
 
@@ -109,8 +133,8 @@ async def create_eventsub_subscription(
     url = "https://api.twitch.tv/helix/eventsub/subscriptions"
 
     headers = {
-        "Authorization": f"Bearer {twitch_user_access_token}",
-        "Client-Id": client_id,
+        "Authorization": f"Bearer {TWITCH_USER_ACCESS_TOKEN}",
+        "Client-Id": TWITCH_CLIENT_ID,
         "Content-Type": "application/json",
     }
 
@@ -135,43 +159,63 @@ async def create_eventsub_subscription(
             f"{response.status_code} {response.text}"
         )
 
-    print(f"subscribed: {subscription_type}")
+    logger.info(
+        "Subscription created | type=%s | broadcaster_user_id=%s | session_id=%s",
+        subscription_type,
+        broadcaster_user_id,
+        session_id,
+    )
 
 
-async def handle_stream_online(bot: Bot) -> int:
-    twitch_data = await fetch_twitch_state()
-    text = build_post_text(twitch_data)
-    message_id = await send_post(bot, tg_channel_id, text)
-    print("stream online, post sent:", message_id)
-    return message_id
+class StreamWatcher:
+    def __init__(self, bot: Bot):
+        self.bot = bot
+        self.current_message_id: Optional[int] = None
+        self.broadcaster_user_id: Optional[str] = None
+        self.seen_message_ids = deque(maxlen=200)
 
+    async def ensure_broadcaster_user_id(self) -> str:
+        if self.broadcaster_user_id is None:
+            twitch_data = await fetch_twitch_state()
+            self.broadcaster_user_id = twitch_data["user_id"]
+            logger.info(
+                "Determined broadcaster_user_id | login=%s | user_id=%s",
+                TWITCH_BROADCASTER_LOGIN,
+                self.broadcaster_user_id,
+            )
+        return self.broadcaster_user_id
 
-async def handle_stream_offline(bot: Bot, message_id: int | None) -> None:
-    if message_id is None:
-        return
+    async def handle_stream_online(self) -> None:
+        if self.current_message_id is not None:
+            logger.info(
+                "Received stream.online, but message already exists | message_id=%s",
+                self.current_message_id,
+            )
+            return
 
-    await delete_post(bot, tg_channel_id, message_id)
-    print("stream offline, post deleted:", message_id)
+        twitch_data = await fetch_twitch_state()
+        text = build_post_text(twitch_data)
 
+        logger.info(
+            "Detected stream.online | login=%s | title=%s",
+            twitch_data["login"],
+            twitch_data["stream_title"] or twitch_data["channel_title"],
+            )
 
-async def listen_eventsub(bot: Bot) -> None:
-    initial_state = await fetch_twitch_state()
-    broadcaster_user_id = initial_state["user_id"]
+        self.current_message_id = await send_post(self.bot, TG_CHANNEL_ID, text)
 
-    current_message_id = None
+    async def handle_stream_offline(self) -> None:
+        logger.info("Detected stream.offline | login=%s", TWITCH_BROADCASTER_LOGIN)
 
-    async with websockets.connect(EVENTSUB_WS_URL) as ws:
-        print("websocket connected")
+        if self.current_message_id is None:
+            logger.info("Nothing to delete | current_message_id=None")
+            return
 
-        welcome_raw = await ws.recv()
-        welcome = json.loads(welcome_raw)
+        await delete_post(self.bot, TG_CHANNEL_ID, self.current_message_id)
+        self.current_message_id = None
 
-        message_type = welcome["metadata"]["message_type"]
-        if message_type != "session_welcome":
-            raise RuntimeError(f"Expected session_welcome, got {message_type}")
-
-        session_id = welcome["payload"]["session"]["id"]
-        print("session_id:", session_id)
+    async def subscribe(self, session_id: str) -> None:
+        broadcaster_user_id = await self.ensure_broadcaster_user_id()
 
         await create_eventsub_subscription(
             "stream.online",
@@ -184,51 +228,133 @@ async def listen_eventsub(bot: Bot) -> None:
             session_id,
         )
 
-        while True:
-            raw_message = await ws.recv()
-            data = json.loads(raw_message)
+    async def listen_once(self, websocket_url: str, stop_event: asyncio.Event) -> Optional[str]:
+        logger.info("Connecting to EventSub WebSocket | url=%s", websocket_url)
 
-            metadata = data.get("metadata", {})
-            payload = data.get("payload", {})
-            message_type = metadata.get("message_type")
+        async with websockets.connect(websocket_url) as ws:
+            welcome_raw = await ws.recv()
+            welcome = json.loads(welcome_raw)
 
-            if message_type == "session_keepalive":
-                print("keepalive")
+            welcome_type = welcome["metadata"]["message_type"]
+            if welcome_type != "session_welcome":
+                raise RuntimeError(f"Expected session_welcome, got {welcome_type}")
+
+            session_id = welcome["payload"]["session"]["id"]
+            logger.info("Received session_welcome | session_id=%s", session_id)
+
+            await self.subscribe(session_id)
+
+            while not stop_event.is_set():
+                raw_message = await ws.recv()
+                data = json.loads(raw_message)
+
+                metadata = data.get("metadata", {})
+                payload = data.get("payload", {})
+                message_type = metadata.get("message_type")
+                message_id = metadata.get("message_id")
+
+                if message_id:
+                    if message_id in self.seen_message_ids:
+                        logger.warning("Skipped duplicate message | message_id=%s", message_id)
+                        continue
+                    self.seen_message_ids.append(message_id)
+
+                if message_type == "session_keepalive":
+                    logger.info("keepalive")
+                    continue
+
+                if message_type == "notification":
+                    subscription = payload.get("subscription", {})
+                    sub_type = subscription.get("type")
+
+                    if sub_type == "stream.online":
+                        await self.handle_stream_online()
+                    elif sub_type == "stream.offline":
+                        await self.handle_stream_offline()
+                    else:
+                        logger.info("Unhandled notification type=%s", sub_type)
+
+                    continue
+
+                if message_type == "session_reconnect":
+                    reconnect_url = payload.get("session", {}).get("reconnect_url")
+                    logger.warning("Twitch requested reconnect | reconnect_url=%s", reconnect_url)
+                    return reconnect_url
+
+                if message_type == "revocation":
+                    raise RuntimeError(f"Subscription revoked: {data}")
+
+                logger.info("Unhandled message: %s", data)
+
+        return None
+
+
+async def run_watcher(bot: Bot, stop_event: asyncio.Event) -> None:
+    watcher = StreamWatcher(bot)
+    websocket_url = EVENTSUB_WS_URL
+
+    while not stop_event.is_set():
+        try:
+            reconnect_url = await watcher.listen_once(websocket_url, stop_event)
+
+            if stop_event.is_set():
+                break
+
+            if reconnect_url:
+                websocket_url = reconnect_url
                 continue
 
-            if message_type == "notification":
-                subscription = payload.get("subscription", {})
-                sub_type = subscription.get("type")
+            websocket_url = EVENTSUB_WS_URL
+            logger.warning("Connection closed without reconnect_url, reconnecting in %s sec", RECONNECT_DELAY_SECONDS)
 
-                if sub_type == "stream.online":
-                    if current_message_id is None:
-                        current_message_id = await handle_stream_online(bot)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.exception("Error in watcher: %s", e)
+            websocket_url = EVENTSUB_WS_URL
 
-                elif sub_type == "stream.offline":
-                    await handle_stream_offline(bot, current_message_id)
-                    current_message_id = None
+        if not stop_event.is_set():
+            await asyncio.sleep(RECONNECT_DELAY_SECONDS)
 
-                else:
-                    print("unknown notification type:", sub_type)
-
-                continue
-
-            if message_type == "session_reconnect":
-                reconnect_url = payload.get("session", {}).get("reconnect_url")
-                raise RuntimeError(f"Reconnect requested: {reconnect_url}")
-
-            if message_type == "revocation":
-                raise RuntimeError(f"Subscription revoked: {data}")
-
-            print("unhandled message:", data)
+    logger.info("Watcher stopped")
 
 
 async def main() -> None:
-    if not twitch_user_access_token:
-        raise RuntimeError("Не найден TWITCH_USER_ACCESS_TOKEN")
+    require_env("TG_BOT_TOKEN")
+    require_env("TG_CHANNEL_ID")
+    require_env("TWITCH_CLIENT_ID")
+    require_env("TWITCH_CLIENT_SECRET")
+    require_env("TWITCH_BROADCASTER_LOGIN")
+    require_env("TWITCH_USER_ACCESS_TOKEN")
 
-    async with Bot(token=tg_bot_token) as bot:
-        await listen_eventsub(bot)
+    stop_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
+
+    def request_shutdown() -> None:
+        if not stop_event.is_set():
+            logger.info("Received shutdown signal, starting graceful shutdown")
+            stop_event.set()
+
+    for sig_name in ("SIGINT", "SIGTERM"):
+        sig = getattr(signal, sig_name, None)
+        if sig is not None:
+            try:
+                loop.add_signal_handler(sig, request_shutdown)
+            except NotImplementedError:
+                pass
+
+    async with Bot(token=TG_BOT_TOKEN) as bot:
+        watcher_task = asyncio.create_task(run_watcher(bot, stop_event))
+
+        await stop_event.wait()
+
+        watcher_task.cancel()
+        try:
+            await watcher_task
+        except asyncio.CancelledError:
+            logger.info("Watcher task cancelled")
+
+    logger.info("Program terminated gracefully")
 
 
 if __name__ == "__main__":
